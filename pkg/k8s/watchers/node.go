@@ -19,6 +19,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/comparator"
 	"github.com/cilium/cilium/pkg/k8s"
+	ciliumio "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	"github.com/cilium/cilium/pkg/k8s/informer"
 	"github.com/cilium/cilium/pkg/node"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
@@ -30,11 +31,10 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 )
 
-func (k *K8sWatcher) nodesInit(k8sClient kubernetes.Interface) {
+func (k *K8sWatcher) nodesInit(k8sClient *k8s.K8sClient) {
 	nodeStore, nodeController := informer.NewInformer(
 		cache.NewListWatchFromClient(k8sClient.CoreV1().RESTClient(),
 			"nodes", v1.NamespaceAll, fields.ParseSelectorOrDie("metadata.name="+nodeTypes.GetName())),
@@ -45,6 +45,9 @@ func (k *K8sWatcher) nodesInit(k8sClient kubernetes.Interface) {
 				var valid bool
 				if node := k8s.ObjToV1Node(obj); node != nil {
 					valid = true
+					if isCiliumTainted(node) {
+						k8sClient.ReMarkNodeReady()
+					}
 					err := k.updateK8sNodeV1(nil, node)
 					k.K8sEventProcessed(metricNode, metricCreate, err == nil)
 				}
@@ -55,6 +58,10 @@ func (k *K8sWatcher) nodesInit(k8sClient kubernetes.Interface) {
 				if oldNode := k8s.ObjToV1Node(oldObj); oldNode != nil {
 					valid = true
 					if newNode := k8s.ObjToV1Node(newObj); newNode != nil {
+						if isCiliumTainted(newNode) {
+							k8sClient.ReMarkNodeReady()
+						}
+
 						oldNodeLabels := oldNode.GetLabels()
 						newNodeLabels := newNode.GetLabels()
 						if comparator.MapStringEquals(oldNodeLabels, newNodeLabels) {
@@ -76,6 +83,17 @@ func (k *K8sWatcher) nodesInit(k8sClient kubernetes.Interface) {
 	k.blockWaitGroupToSyncResources(wait.NeverStop, nil, nodeController.HasSynced, k8sAPIGroupNodeV1Core)
 	go nodeController.Run(wait.NeverStop)
 	k.k8sAPIGroups.AddAPI(k8sAPIGroupNodeV1Core)
+}
+
+// isCiliumTainted returns true if the given node has the Cilium Agent Not Ready
+// Node Taint.
+func isCiliumTainted(k8sNode *v1.Node) bool {
+	for _, taint := range k8sNode.Spec.Taints {
+		if taint.Key == ciliumio.AgentNotReadyNodeTaint {
+			return true
+		}
+	}
+	return false
 }
 
 func (k *K8sWatcher) updateK8sNodeV1(oldK8sNode, newK8sNode *v1.Node) error {
